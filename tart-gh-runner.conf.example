@@ -1,0 +1,19 @@
+# Copy to ~/.config/tart-gh-runner/config and edit. Every value is required.
+
+# The repository runners register against, as owner/name.
+REPO="your-org/your-repo"
+
+# The stopped Tart VM cloned for each job. See README "The golden image".
+GOLDEN="ci-base"
+
+# Labels the runner advertises. Your workflow's `runs-on` must match one.
+# Keep a distinctive label: `runs-on` takes a single label, and `self-hosted`
+# or `macOS` alone will collide with every other runner you ever add.
+LABELS="self-hosted,macOS,ARM64,ci-vm"
+
+# Private key whose public half is in the golden image's authorized_keys.
+# Generate one FOR THIS PURPOSE; do not reuse a personal key.
+KEY="$HOME/.tart-gh-runner/id_ed25519"
+
+# User inside the VM. cirruslabs images use `admin`.
+VM_USER="admin"

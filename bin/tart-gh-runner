@@ -1,0 +1,85 @@
+#!/bin/bash
+# One GitHub Actions job, in one throwaway macOS VM, then the VM is destroyed.
+#
+# Reads its configuration from ~/.config/tart-gh-runner/config (or $CONFIG).
+# See tart-gh-runner.conf.example. The README explains why this exists.
+set -uo pipefail
+
+CONFIG="${CONFIG:-$HOME/.config/tart-gh-runner/config}"
+# shellcheck source=/dev/null
+[ -r "$CONFIG" ] || { echo "no config at $CONFIG — copy tart-gh-runner.conf.example"; exit 78; }
+. "$CONFIG"
+
+for required in REPO GOLDEN LABELS KEY; do
+  [ -n "${!required:-}" ] || { echo "$CONFIG does not set $required"; exit 78; }
+done
+VM_USER="${VM_USER:-admin}"
+VM="ci-$(date +%s)-$$"
+
+log() { echo "[$(date -u +%H:%M:%S)] $*"; }
+vmssh() {
+  ssh -i "$KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+      -o LogLevel=ERROR -o BatchMode=yes -o ConnectTimeout=10 "$VM_USER@$IP" "$@"
+}
+
+# The VM outlives no failure path, including this script being killed.
+cleanup() {
+  tart stop "$VM" >/dev/null 2>&1
+  sleep 2
+  tart delete "$VM" >/dev/null 2>&1
+  log "destroyed $VM"
+}
+trap cleanup EXIT INT TERM
+
+# A registration token is valid for one hour and one registration, so minting
+# per job means a leaked one expires on its own.
+TOKEN="$(gh api -X POST "repos/$REPO/actions/runners/registration-token" --jq .token 2>/dev/null)"
+
+# STRIPPED, NOT TRUSTED. Run from launchd, `gh` may be unable to reach the
+# login keyring and returns {"message":"Requires authentication"} instead of a
+# token. Passed on unchecked, that JSON reaches the runner's HTTP client and
+# comes back as "New-line characters are not allowed in header values" — a
+# message about headers, three layers from the cause. Run this as a LaunchAgent
+# in a logged-in session, not a LaunchDaemon; the length check below is the
+# backstop for the day that is not true.
+RAW_LEN=${#TOKEN}
+TOKEN="$(printf '%s' "$TOKEN" | tr -d '[:space:]')"
+[ "$RAW_LEN" -eq "${#TOKEN}" ] || log "token carried whitespace (raw $RAW_LEN -> ${#TOKEN}); stripped"
+if [ "${#TOKEN}" -lt 20 ]; then
+  log "no usable registration token (${#TOKEN} chars) — is gh authenticated with repo admin?"
+  exit 1
+fi
+
+log "cloning $GOLDEN -> $VM"
+tart clone "$GOLDEN" "$VM" || exit 1
+tart run "$VM" --no-graphics >/dev/null 2>&1 &
+
+IP=""
+for _ in $(seq 1 60); do
+  IP="$(tart ip "$VM" 2>/dev/null)"
+  [ -n "$IP" ] && break
+  sleep 2
+done
+[ -n "$IP" ] || { log "VM never got an IP"; exit 1; }
+log "VM up at $IP"
+
+# Built in a variable and passed as one argument. Wrapping this across lines
+# inside quotes put a literal newline into the token argument once already.
+CONFIGURE="cd ~/actions-runner && ./config.sh --url https://github.com/$REPO --token $TOKEN --name $VM --labels $LABELS --unattended --ephemeral --replace"
+
+# sshd accepting a connection is not the login environment being ready: an
+# attempt three seconds after boot failed where one six seconds later worked.
+registered=false
+for attempt in 1 2 3 4 5 6; do
+  if out="$(vmssh "$CONFIGURE" 2>&1)"; then registered=true; break; fi
+  log "registration attempt $attempt: $(printf '%s' "$out" | tail -1)"
+  sleep 8
+done
+[ "$registered" = true ] || { log "registration failed after 6 attempts"; exit 1; }
+log "registered $VM, waiting for one job"
+
+# --ephemeral means run.sh returns after exactly one job, and the runner
+# de-registers itself. Returning is the signal for the supervisor to start the
+# next VM.
+vmssh 'cd ~/actions-runner && ./run.sh'
+log "job finished"
