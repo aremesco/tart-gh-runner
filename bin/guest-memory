@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# What memory and swap a CI job actually used, per job, from host-side samples.
+#
+# The supervisor writes one sample file per VM, named for the VM. GitHub reports
+# that same name as a job's `runner_name`, so a job and its memory curve join on
+# a string both sides already have — no instrumentation in the workflow, and
+# nothing for a repository to opt into.
+#
+# Peak swap is the number to read. A guest that never touches swap has headroom;
+# one that peaks near its swapfile is a job about to fail on a machine slightly
+# slower or slightly busier than this one, and it will fail as a timeout or a
+# killed linker rather than as anything that says "memory".
+#
+#   guest-memory <run-id>     every job in that run
+#   guest-memory              every sample file still on disk
+set -uo pipefail
+
+CONFIG="${CONFIG:-$HOME/.config/tart-gh-runner/config}"
+# shellcheck source=/dev/null
+[ -r "$CONFIG" ] && . "$CONFIG"
+STATE_DIR="${STATE_DIR:-$HOME/.local/state/tart-gh-runner}"
+MEM="$STATE_DIR/mem"
+
+[ -d "$MEM" ] || { echo "no samples at $MEM — is SAMPLE_SECONDS non-zero?" >&2; exit 1; }
+
+jobs_json=""
+if [ -n "${1:-}" ]; then
+  command -v gh >/dev/null || { echo "gh is required to name jobs" >&2; exit 127; }
+  jobs_json="$(gh api "repos/${REPO:?set REPO in $CONFIG}/actions/runs/$1/jobs" --paginate \
+               --jq '.jobs[] | [.runner_name, .name, .conclusion] | @tsv' 2>/dev/null)"
+  [ -n "$jobs_json" ] || { echo "no jobs for run $1" >&2; exit 1; }
+fi
+
+export JOBS="$jobs_json"
+python3 - "$MEM" <<'PY'
+import os, pathlib, sys
+
+names = {}
+for line in (os.environ.get("JOBS") or "").splitlines():
+    parts = line.split("\t")
+    if len(parts) == 3 and parts[0]:
+        names[parts[0]] = (parts[1], parts[2])
+
+rows = []
+for f in sorted(pathlib.Path(sys.argv[1]).glob("*.tsv")):
+    vm = f.stem
+    if names and vm not in names:
+        continue  # a VM from some other run
+    samples = []
+    for line in f.read_text().splitlines()[1:]:
+        p = line.split("\t")
+        if len(p) == 5:
+            try:
+                samples.append(tuple(int(x) for x in p))
+            except ValueError:
+                pass
+    if not samples:
+        continue
+    job, concl = names.get(vm, ("(unjoined)", "-"))
+    total = samples[0][1]
+    swap_total = max(s[3] for s in samples)
+    rows.append({
+        "job": job, "concl": concl, "vm": vm,
+        "mins": (samples[-1][0] - samples[0][0]) / 60,
+        "n": len(samples),
+        "total": total,
+        "low": min(s[2] for s in samples if s[2] >= 0) if any(s[2] >= 0 for s in samples) else -1,
+        "swap_total": swap_total,
+        "swap_peak": max(s[4] for s in samples),
+    })
+
+if not rows:
+    print("  no samples matched"); raise SystemExit
+
+rows.sort(key=lambda r: -r["swap_peak"])
+w = max(len(r["job"]) for r in rows)
+print(f'  {"job":<{w}}  {"ram":>7}  {"low avail":>9}  {"swap peak":>10}  {"of swap":>8}  {"mins":>5}  {"n":>4}')
+for r in rows:
+    pct = f'{r["swap_peak"]*100//r["swap_total"]}%' if r["swap_total"] else "-"
+    avail = f'{r["low"]} MB' if r["low"] >= 0 else "-"
+    flag = "  <-- swap in use" if r["swap_peak"] > 0 else ""
+    print(f'  {r["job"]:<{w}}  {r["total"]:>4} MB  {avail:>9}  {r["swap_peak"]:>7} MB  {pct:>8}  '
+          f'{r["mins"]:>5.1f}  {r["n"]:>4}{flag}')
+
+peak = max(rows, key=lambda r: r["swap_peak"])
+print()
+if peak["swap_peak"] == 0:
+    print(f'  No job touched swap. Lowest available memory was {min(r["low"] for r in rows if r["low"]>=0)} MB '
+          f'of {rows[0]["total"]} MB — that is the headroom, and it is real.')
+else:
+    print(f'  Peak swap: {peak["swap_peak"]} MB in {peak["job"]}, '
+          f'{peak["swap_peak"]*100//peak["swap_total"]}% of its swapfile.')
+    print(f'  A guest in swap is a job whose wall clock depends on disk. If it also '
+          f'timed out, that is the cause and not a coincidence.')
+PY

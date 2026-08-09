@@ -6,8 +6,8 @@
 set -uo pipefail
 
 CONFIG="${CONFIG:-$HOME/.config/tart-gh-runner/config}"
-# shellcheck source=/dev/null
 [ -r "$CONFIG" ] || { echo "no config at $CONFIG — copy tart-gh-runner.conf.example"; exit 78; }
+# shellcheck source=/dev/null
 . "$CONFIG"
 
 for required in REPO GOLDEN LABELS KEY; do
@@ -15,6 +15,8 @@ for required in REPO GOLDEN LABELS KEY; do
 done
 VM_USER="${VM_USER:-admin}"
 VM="ci-$(date +%s)-$$"
+STATE_DIR="${STATE_DIR:-$HOME/.local/state/tart-gh-runner}"
+SAMPLE_SECONDS="${SAMPLE_SECONDS:-5}"   # 0 disables memory sampling
 
 log() { echo "[$(date -u +%H:%M:%S)] $*"; }
 vmssh() {
@@ -22,8 +24,43 @@ vmssh() {
       -o LogLevel=ERROR -o BatchMode=yes -o ConnectTimeout=10 "$VM_USER@$IP" "$@"
 }
 
+# Memory and swap inside the guest, sampled FROM THE HOST.
+#
+# A guest that exhausts memory is the case worth measuring, and it is the case
+# an in-guest sampler cannot report: the OOM killer takes the sampler along
+# with everything else, and the samples immediately before the kill — the only
+# ones that show the approach — are the ones lost. So the loop runs over the
+# same SSH the supervisor already holds and the host owns the file. If the
+# guest dies mid-sample the record simply stops, with everything up to that
+# instant already on disk.
+#
+# One connection, not one per sample. The remote side is POSIX sh and reads
+# /proc/meminfo on Linux, sysctl on macOS, so a single supervisor script serves
+# both fleets.
+SAMPLER_PID=""
+sample_memory() {
+  mkdir -p "$STATE_DIR/mem"
+  local out="$STATE_DIR/mem/$VM.tsv"
+  printf 'epoch\tmem_total_mb\tmem_avail_mb\tswap_total_mb\tswap_used_mb\n' > "$out"
+  vmssh -o ServerAliveInterval=15 "
+    while :; do
+      if [ -r /proc/meminfo ]; then
+        awk '/^MemTotal:/{t=\$2} /^MemAvailable:/{a=\$2} /^SwapTotal:/{s=\$2} /^SwapFree:/{f=\$2}
+             END{printf \"%d\t%d\t%d\t%d\n\", t/1024, a/1024, s/1024, (s-f)/1024}' /proc/meminfo
+      else
+        sysctl -n hw.memsize vm.swapusage | awk 'NR==1{t=\$1/1048576}
+             NR==2{gsub(/M/,\"\"); s=\$3; u=\$6}
+             END{printf \"%d\t-1\t%d\t%d\n\", t, s, u}'
+      fi
+      sleep $SAMPLE_SECONDS
+    done" 2>/dev/null \
+    | while IFS= read -r line; do printf '%s\t%s\n' "$(date +%s)" "$line" >> "$out"; done &
+  SAMPLER_PID=$!
+}
+
 # The VM outlives no failure path, including this script being killed.
 cleanup() {
+  [ -n "$SAMPLER_PID" ] && kill "$SAMPLER_PID" 2>/dev/null
   tart stop "$VM" >/dev/null 2>&1
   sleep 2
   tart delete "$VM" >/dev/null 2>&1
@@ -77,6 +114,14 @@ for attempt in 1 2 3 4 5 6; do
 done
 [ "$registered" = true ] || { log "registration failed after 6 attempts"; exit 1; }
 log "registered $VM, waiting for one job"
+
+# After registration, so the samples cover the job rather than the boot. The
+# runner's own name IS $VM, which is what GitHub reports as `runner_name` on
+# every job — so this file joins to a job with no correlation step.
+if [ "$SAMPLE_SECONDS" -gt 0 ]; then
+  sample_memory
+  log "sampling guest memory every ${SAMPLE_SECONDS}s -> $STATE_DIR/mem/$VM.tsv"
+fi
 
 # --ephemeral means run.sh returns after exactly one job, and the runner
 # de-registers itself. Returning is the signal for the supervisor to start the
