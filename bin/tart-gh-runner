@@ -89,6 +89,14 @@ fi
 
 log "cloning $GOLDEN -> $VM"
 tart clone "$GOLDEN" "$VM" || exit 1
+# The guest's size is a FLEET decision, made here, never inherited. A clone
+# copies the golden's cpu/memory config, and the golden's is whatever the
+# image BUILD needed — a rebuild once shipped 8 GB guests onto a fleet sized
+# for 4, reserving 64 GB of a 48 GB host, and nothing said so until the host
+# was down to 60 MB of free pages. Set explicitly, a rebuild cannot resize
+# the fleet.
+[ -n "${VM_MEMORY:-}" ] && tart set "$VM" --memory "$VM_MEMORY"
+[ -n "${VM_CPU:-}" ] && tart set "$VM" --cpu "$VM_CPU"
 tart run "$VM" --no-graphics >/dev/null 2>&1 &
 
 IP=""
