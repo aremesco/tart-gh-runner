@@ -19,9 +19,16 @@ STATE_DIR="${STATE_DIR:-$HOME/.local/state/tart-gh-runner}"
 SAMPLE_SECONDS="${SAMPLE_SECONDS:-5}"   # 0 disables memory sampling
 
 log() { echo "[$(date -u +%H:%M:%S)] $*"; }
+# ServerAlive on EVERY session, not just the sampler's. A VM that dies without
+# closing its TCP sessions — `tart stop`, a host sleep, a panic — leaves a
+# keepalive-less ssh waiting forever, and a supervisor waiting forever is a
+# fleet that is down while launchd reports every agent running. Eight of them
+# did exactly that for an hour and twenty minutes; 45 seconds is the new worst
+# case for noticing a dead guest.
 vmssh() {
   ssh -i "$KEY" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-      -o LogLevel=ERROR -o BatchMode=yes -o ConnectTimeout=10 "$VM_USER@$IP" "$@"
+      -o LogLevel=ERROR -o BatchMode=yes -o ConnectTimeout=10 \
+      -o ServerAliveInterval=15 -o ServerAliveCountMax=3 "$VM_USER@$IP" "$@"
 }
 
 # Memory and swap inside the guest, sampled FROM THE HOST.
