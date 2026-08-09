@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# Rebuild the golden CI image on a schedule, so its caches stay a cache.
+#
+# The golden carries warmed caches — a pnpm store, a compiler cache, container
+# images, a toolchain — and every one of them is a snapshot of the week it was
+# built. Left alone they decay from cache into drag: the store misses more of
+# the lockfile, sccache misses more of the tree, and `postgres:17` quietly
+# means something months old. A weekly rebuild from main's HEAD is what keeps
+# "frozen at build time" a feature instead of a slow leak.
+#
+# SAFE BY CONSTRUCTION: build-golden.sh verifies a clone of the new image and
+# promotes only on success, so a failed weekly build leaves the fleet on last
+# week's image — worse caches, correct behaviour. This wrapper adds the two
+# things a scheduled run needs on top: a CLEAN CHECKOUT (the fleet's image
+# tracks main, never whatever a development worktree happens to hold), and a
+# visible failure (a user notification — a log line at 3am is a tree falling
+# in a forest).
+#
+# Reads from the same config as the supervisor:
+#   GOLDEN_REPO       clone URL of the repository holding the image scripts
+#   GOLDEN_BUILD_CMD  command run at the checkout root (default below)
+set -uo pipefail
+
+CONFIG="${CONFIG:-$HOME/.config/tart-gh-runner/config}"
+# shellcheck source=/dev/null
+[ -r "$CONFIG" ] && . "$CONFIG"
+
+REPO_URL="${GOLDEN_REPO:?set GOLDEN_REPO in $CONFIG}"
+BUILD_CMD="${GOLDEN_BUILD_CMD:-tools/ci-image/build-golden.sh linux}"
+STATE_DIR="${STATE_DIR:-$HOME/.local/state/tart-gh-runner}"
+CHECKOUT="$STATE_DIR/golden-src"
+LOG="$STATE_DIR/golden-rebuild.log"
+
+mkdir -p "$STATE_DIR"
+exec >> "$LOG" 2>&1
+echo "==== rebuild starting $(date -u +%FT%TZ) ===="
+
+fail() {
+  echo "FAILED: $1"
+  # The fleet is untouched on failure; the human still has to hear about it,
+  # because a golden that silently stops refreshing is the drift this whole
+  # script exists to prevent.
+  /usr/bin/osascript -e "display notification \"$1 — fleet stays on the old image; see golden-rebuild.log\" with title \"CI golden rebuild failed\"" 2>/dev/null
+  exit 1
+}
+
+# A checkout of main and nothing else. Reset hard rather than merge: this
+# clone exists only to mirror origin, and anything local in it is wreckage.
+if [ ! -d "$CHECKOUT/.git" ]; then
+  git clone --quiet "$REPO_URL" "$CHECKOUT" || fail "clone of $REPO_URL"
+fi
+git -C "$CHECKOUT" fetch --quiet origin || fail "git fetch"
+git -C "$CHECKOUT" checkout --quiet --detach origin/HEAD || fail "checkout origin/HEAD"
+git -C "$CHECKOUT" reset --quiet --hard || fail "reset"
+echo "building from $(git -C "$CHECKOUT" rev-parse --short HEAD) ($(git -C "$CHECKOUT" log -1 --format=%s))"
+
+(cd "$CHECKOUT" && $BUILD_CMD) || fail "build-golden did not promote"
+
+echo "==== promoted $(date -u +%FT%TZ) ===="

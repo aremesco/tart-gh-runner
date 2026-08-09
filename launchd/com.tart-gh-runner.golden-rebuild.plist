@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.tart-gh-runner.golden-rebuild</string>
+  <key>ProgramArguments</key>
+  <array><string>/usr/local/bin/rebuild-golden</string></array>
+  <!-- Sunday 03:00 local: the queue's quietest hour, and the build wants the
+       host's memory to itself — its 8 GB VM sits on top of whatever the fleet
+       is holding. If the machine is asleep or off, launchd runs it on next
+       wake rather than skipping the week. -->
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Weekday</key><integer>0</integer>
+    <key>Hour</key><integer>3</integer>
+    <key>Minute</key><integer>0</integer>
+  </dict>
+  <key>EnvironmentVariables</key>
+  <dict><key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin</string></dict>
+  <!-- The script keeps its own log; these catch anything before exec lands. -->
+  <key>StandardOutPath</key><string>/tmp/tart-gh-runner-golden.log</string>
+  <key>StandardErrorPath</key><string>/tmp/tart-gh-runner-golden.log</string>
+</dict>
+</plist>
